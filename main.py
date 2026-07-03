@@ -1,6 +1,7 @@
 import os
 import logging
 import sqlite3
+import re
 import pytz
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
@@ -24,7 +25,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
 
-# ---------------------- НАСТРОЙКИ ----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/Moscow")
 DB_PATH = os.environ.get("DB_PATH", "database.db")
@@ -40,18 +40,19 @@ logger = logging.getLogger(__name__)
 
 TZ = pytz.timezone(DEFAULT_TIMEZONE)
 
-# Состояния диалогов
 R_TEXT, R_CHOOSE_TIME, R_CUSTOM_TIME, R_REPEAT = range(4)
 H_NAME, H_TYPE = range(4, 6)
-W_CUSTOM_AMOUNT, W_GOAL = range(6, 8)
+HR_TIMES = 6
+S_SLEEP_TIME, S_WAKE_TIME = range(7, 9)
 
-HABIT_REMINDER_TIMES = [(9, 0), (21, 0)]
-
-# ---------------------- КЛАВИАТУРЫ ----------------------
+DEFAULT_HABIT_TIMES = ["09:00", "13:00", "21:00"]
+DEFAULT_SLEEP_TIME = "23:00"
+DEFAULT_WAKE_TIME = "07:00"
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["🎯 Привычки", "💧 Вода", "📅 Сегодня"],
+        ["🎯 Привычки", "💧 Вода"],
+        ["📅 Сегодня", "😴 Сон"],
         ["➕ Напоминание", "📋 Мои напоминания"],
         ["🗑 Удалить напоминание", "❓ Помощь"],
     ],
@@ -102,8 +103,6 @@ REPEAT_LABELS = {
     "monthly": "ежемесячно",
 }
 
-
-# ---------------------- БАЗА ДАННЫХ ----------------------
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -160,6 +159,42 @@ def init_db():
 
     c.execute(
         """
+        CREATE TABLE IF NOT EXISTS habit_reminders (
+            user_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            times TEXT NOT NULL DEFAULT '09:00,13:00,21:00'
+        )
+        """
+    )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sleep_schedule (
+            user_id INTEGER PRIMARY KEY,
+            sleep_time TEXT NOT NULL DEFAULT '23:00',
+            wake_time TEXT NOT NULL DEFAULT '07:00',
+            enabled INTEGER NOT NULL DEFAULT 0,
+            reminder_enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sleep_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            log_date TEXT NOT NULL,
+            sleep_status TEXT,
+            wake_status TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, log_date)
+        )
+        """
+    )
+
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS water_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -183,8 +218,6 @@ def init_db():
     conn.close()
 
 
-# ---------- Users ----------
-
 def ensure_user(user_id: int, chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -200,18 +233,14 @@ def ensure_user(user_id: int, chat_id: int):
     conn.close()
 
 
-def get_users_with_habits():
+def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT DISTINCT h.user_id, u.chat_id FROM habits h JOIN users u ON h.user_id = u.user_id"
-    )
+    c.execute("SELECT user_id, chat_id FROM users")
     rows = c.fetchall()
     conn.close()
     return rows
 
-
-# ---------- Reminders ----------
 
 def add_reminder(user_id: int, chat_id: int, text: str, next_run: datetime, repeat_type: str) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -272,8 +301,6 @@ def delete_reminder_by_id(reminder_id: int):
     conn.commit()
     conn.close()
 
-
-# ---------- Habits ----------
 
 def add_habit(user_id: int, name: str, habit_type: str) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -379,7 +406,6 @@ def compute_streak(habit_type: str, logs: list) -> int:
 
 
 def compute_habit_stats(habit_type: str, logs: list, days: int = 30) -> tuple:
-    """Возвращает (успешных дней, всего дней с логами, процент)."""
     status_needed = "done" if habit_type == "good" else "not_done"
     cutoff = date.today() - timedelta(days=days - 1)
     filtered = [(d, s) for d, s in logs if date.fromisoformat(d) >= cutoff]
@@ -389,7 +415,148 @@ def compute_habit_stats(habit_type: str, logs: list, days: int = 30) -> tuple:
     return success, total, percent
 
 
-# ---------- Water ----------
+def get_habit_reminder_settings(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT enabled, times FROM habit_reminders WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return bool(row[0]), row[1].split(",")
+    return True, DEFAULT_HABIT_TIMES
+
+
+def set_habit_reminder_enabled(user_id: int, enabled: bool):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    times_str = ",".join(DEFAULT_HABIT_TIMES)
+    c.execute(
+        """
+        INSERT INTO habit_reminders (user_id, enabled, times)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled
+        """,
+        (user_id, int(enabled), times_str),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_habit_reminder_times(user_id: int, times: list):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO habit_reminders (user_id, enabled, times)
+        VALUES (?, 1, ?)
+        ON CONFLICT(user_id) DO UPDATE SET times=excluded.times
+        """,
+        (user_id, ",".join(times)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_sleep_schedule(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT sleep_time, wake_time, enabled, reminder_enabled FROM sleep_schedule WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "sleep_time": row[0],
+            "wake_time": row[1],
+            "enabled": bool(row[2]),
+            "reminder_enabled": bool(row[3]),
+        }
+    return {
+        "sleep_time": DEFAULT_SLEEP_TIME,
+        "wake_time": DEFAULT_WAKE_TIME,
+        "enabled": False,
+        "reminder_enabled": True,
+    }
+
+
+def set_sleep_schedule(user_id: int, sleep_time: str, wake_time: str, enabled: bool = None, reminder_enabled: bool = None):
+    current = get_sleep_schedule(user_id)
+    if enabled is None:
+        enabled = current["enabled"]
+    if reminder_enabled is None:
+        reminder_enabled = current["reminder_enabled"]
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO sleep_schedule (user_id, sleep_time, wake_time, enabled, reminder_enabled)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            sleep_time=excluded.sleep_time,
+            wake_time=excluded.wake_time,
+            enabled=excluded.enabled,
+            reminder_enabled=excluded.reminder_enabled
+        """,
+        (user_id, sleep_time, wake_time, int(enabled), int(reminder_enabled)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_sleep(user_id: int, log_date: date, field: str, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO sleep_logs (user_id, log_date, sleep_status, wake_status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, log_date) DO UPDATE SET {}=excluded.{}
+        """.format(field, field),
+        (user_id, log_date.isoformat(), None if field != "sleep_status" else status,
+         None if field != "wake_status" else status, datetime.now(pytz.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_sleep_logs(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT log_date, sleep_status, wake_status FROM sleep_logs WHERE user_id = ? ORDER BY log_date DESC",
+        (user_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_sleep_log_for_date(user_id: int, log_date: date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT sleep_status, wake_status FROM sleep_logs WHERE user_id = ? AND log_date = ?",
+        (user_id, log_date.isoformat()),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row if row else (None, None)
+
+
+def compute_sleep_streak(user_id: int) -> int:
+    logs = get_sleep_logs(user_id)
+    dates = {date.fromisoformat(d): (s == "ok", w == "ok") for d, s, w in logs}
+
+    today = date.today()
+    streak = 0
+    check_day = today - timedelta(days=1)
+
+    while dates.get(check_day, (False, False)) == (True, True):
+        streak += 1
+        check_day -= timedelta(days=1)
+
+    return streak
+
 
 def add_water(user_id: int, amount_ml: int, log_date: date = None):
     if log_date is None:
@@ -454,12 +621,10 @@ def get_water_stats(user_id: int, days: int = 7):
     return rows
 
 
-# ---------------------- ПЛАНИРОВЩИК ----------------------
-
 scheduler = AsyncIOScheduler(timezone=DEFAULT_TIMEZONE)
 
 
-def compute_next_run(repeat_type: str, base: datetime) -> datetime | None:
+def compute_next_run(repeat_type: str, base: datetime):
     if repeat_type == "daily":
         return base + timedelta(days=1)
     if repeat_type == "weekly":
@@ -542,18 +707,19 @@ async def load_reminders_to_scheduler(app: Application):
     logger.info(f"Загружено напоминаний из БД: {len(rows)}")
 
 
-# ---------- Habit reminders ----------
-
 async def send_habit_reminder_job(context, application: Application):
     job = context.job
     user_id = job.data["user_id"]
     chat_id = job.data["chat_id"]
 
+    enabled, times = get_habit_reminder_settings(user_id)
+    if not enabled:
+        return
+
     habits = get_user_habits(user_id)
     if not habits:
         return
 
-    # Собираем привычки без отметки сегодня
     pending_good = []
     pending_bad = []
     for hid, name, habit_type in habits:
@@ -584,11 +750,23 @@ async def send_habit_reminder_job(context, application: Application):
 
 
 def schedule_habit_reminders(app: Application, user_id: int, chat_id: int):
-    for i, (hour, minute) in enumerate(HABIT_REMINDER_TIMES):
+    enabled, times = get_habit_reminder_settings(user_id)
+    for job in scheduler.get_jobs():
+        if job.id.startswith(f"habit_reminder_{user_id}_"):
+            job.remove()
+
+    if not enabled:
+        return
+
+    for i, t in enumerate(times):
+        try:
+            hour, minute = map(int, t.split(":"))
+        except ValueError:
+            continue
         job_id = f"habit_reminder_{user_id}_{i}"
         scheduler.add_job(
             send_habit_reminder_job,
-            trigger=CronTrigger(hour=hour, minute=minute),
+            trigger=CronTrigger(hour=hour, minute=minute, timezone=TZ),
             id=job_id,
             replace_existing=True,
             args=[app],
@@ -597,13 +775,110 @@ def schedule_habit_reminders(app: Application, user_id: int, chat_id: int):
 
 
 async def load_habit_reminders(app: Application):
-    rows = get_users_with_habits()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT DISTINCT h.user_id, u.chat_id FROM habits h JOIN users u ON h.user_id = u.user_id"
+    )
+    rows = c.fetchall()
+    conn.close()
     for user_id, chat_id in rows:
         schedule_habit_reminders(app, user_id, chat_id)
     logger.info(f"Загружено напоминаний о привычках для {len(rows)} пользователей")
 
 
-# ---------------------- УТИЛИТЫ ----------------------
+async def send_sleep_reminder_job(context, application: Application):
+    job = context.job
+    user_id = job.data["user_id"]
+    chat_id = job.data["chat_id"]
+    remind_type = job.data["type"]
+    log_date_str = job.data["log_date"]
+    log_date = date.fromisoformat(log_date_str)
+
+    sched = get_sleep_schedule(user_id)
+    if not sched["enabled"] or not sched["reminder_enabled"]:
+        return
+
+    if remind_type == "evening":
+        text = (
+            f"😴 Скоро время отбоя: <b>{sched['sleep_time']}</b>\n\n"
+            f"Ложись вовремя, чтобы сохранить стрик сна!"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Лёг вовремя", callback_data=f"sleep_log_{log_date.isoformat()}_sleep_ok"),
+                InlineKeyboardButton("❌ Не вовремя", callback_data=f"sleep_log_{log_date.isoformat()}_sleep_fail"),
+            ],
+        ])
+    else:
+        text = (
+            f"🌅 Доброе утро! Время подъёма: <b>{sched['wake_time']}</b>\n\n"
+            f"Встал вовремя?"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Встал вовремя", callback_data=f"sleep_log_{log_date.isoformat()}_wake_ok"),
+                InlineKeyboardButton("❌ Не вовремя", callback_data=f"sleep_log_{log_date.isoformat()}_wake_fail"),
+            ],
+        ])
+
+    try:
+        await application.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка отправки напоминания о сне {user_id}: {e}")
+
+
+def schedule_sleep_reminders(app: Application, user_id: int, chat_id: int):
+    sched = get_sleep_schedule(user_id)
+
+    for job in scheduler.get_jobs():
+        if job.id.startswith(f"sleep_reminder_{user_id}_"):
+            job.remove()
+
+    if not sched["enabled"] or not sched["reminder_enabled"]:
+        return
+
+    try:
+        sleep_h, sleep_m = map(int, sched["sleep_time"].split(":"))
+        wake_h, wake_m = map(int, sched["wake_time"].split(":"))
+    except ValueError:
+        return
+
+    evening = datetime.strptime(f"{sleep_h}:{sleep_m}", "%H:%M") - timedelta(minutes=15)
+    evening_h, evening_m = evening.hour, evening.minute
+    today = date.today()
+
+    scheduler.add_job(
+        send_sleep_reminder_job,
+        trigger=CronTrigger(hour=evening_h, minute=evening_m, timezone=TZ),
+        id=f"sleep_reminder_{user_id}_evening",
+        replace_existing=True,
+        args=[app],
+        data={"user_id": user_id, "chat_id": chat_id, "type": "evening", "log_date": today.isoformat()},
+    )
+
+    scheduler.add_job(
+        send_sleep_reminder_job,
+        trigger=CronTrigger(hour=wake_h, minute=wake_m, timezone=TZ),
+        id=f"sleep_reminder_{user_id}_morning",
+        replace_existing=True,
+        args=[app],
+        data={"user_id": user_id, "chat_id": chat_id, "type": "morning", "log_date": today.isoformat()},
+    )
+
+
+async def load_sleep_reminders(app: Application):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT s.user_id, u.chat_id FROM sleep_schedule s JOIN users u ON s.user_id = u.user_id WHERE s.enabled = 1"
+    )
+    rows = c.fetchall()
+    conn.close()
+    for user_id, chat_id in rows:
+        schedule_sleep_reminders(app, user_id, chat_id)
+    logger.info(f"Загружено напоминаний о сне для {len(rows)} пользователей")
+
 
 async def back_to_menu(update: Update, text: str):
     if update.callback_query:
@@ -624,12 +899,20 @@ async def ensure_user_from_update(update: Update):
     return user_id, chat_id
 
 
-# ---------------------- ОБРАБОТЧИКИ: ГЛАВНОЕ МЕНЮ ----------------------
+def parse_time_list(text: str):
+    times = [t.strip() for t in text.split(",")]
+    valid = []
+    pattern = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+    for t in times:
+        if pattern.match(t):
+            valid.append(t)
+    return valid
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_from_update(update)
     await update.message.reply_text(
-        "Привет! Я твой помощник: напоминания, привычки и трекер воды.\n\n"
+        "Привет! Я твой помощник: напоминания, привычки, сон и трекер воды.\n\n"
         "Всё управление — кнопками ниже 👇",
         reply_markup=MAIN_MENU,
     )
@@ -639,16 +922,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "<b>Напоминания</b>\n"
         "• ➕ Напоминание — текст → время → периодичность\n"
-        "• 📋 Мои напоминания — список\n"
-        "• 🗑 Удалить напоминание\n\n"
+        "• 📋 Мои напоминания — список\n\n"
         "<b>Привычки</b>\n"
-        "• 🎯 Привычки — сразу открывает список с кнопками отметки\n"
-        "• 👍 Полезные — жми ✅\n"
-        "• 🚫 Вредные — жми 🔥 Держусь\n"
-        "• Автоматические напоминания: 9:00 и 21:00\n\n"
+        "• 🎯 Привычки — список с кнопками отметки\n"
+        "• ⚙️ Внутри меню можно настроить 3 напоминания в день\n\n"
+        "<b>Сон</b>\n"
+        "• 😴 Сон — расписание, стрик, напоминания вечером и утром\n\n"
         "<b>Вода</b>\n"
-        "• 💧 Вода — быстро добавить +200/+300/+500 мл\n"
-        "• 📅 Сегодня — дашборд дня\n\n"
+        "• 💧 Вода — быстрое добавление и статистика\n\n"
+        "<b>📅 Сегодня</b> — дашборд дня\n\n"
         f"Часовой пояс: <b>{DEFAULT_TIMEZONE}</b>"
     )
     if update.callback_query:
@@ -662,30 +944,29 @@ async def today_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_from_update(update)
     user_id = update.effective_user.id
 
-    # Привычки
     habits = get_user_habits(user_id)
     today = date.today()
     habit_lines = []
     pending = 0
     for hid, name, habit_type in habits:
+        logs = get_habit_logs(hid)
+        streak = compute_streak(habit_type, logs)
         status = get_habit_log_for_date(hid, today)
+        icon = "👍" if habit_type == "good" else "🚫"
         if status:
-            if habit_type == "good":
-                habit_lines.append(f"✅ {name}")
-            else:
-                habit_lines.append(f"🔥 {name}")
+            habit_lines.append(f"{icon} ✅ {name} (🔥{streak})")
         else:
             pending += 1
-            if habit_type == "good":
-                habit_lines.append(f"⬜ {name}")
-            else:
-                habit_lines.append(f"⬜ {name} (сдержаться)")
+            habit_lines.append(f"{icon} ⬜ {name} (🔥{streak})")
 
-    # Вода
     today_ml = get_water_today(user_id)
     goal_ml = get_water_goal(user_id)
 
-    # Напоминания
+    sched = get_sleep_schedule(user_id)
+    sleep_streak = compute_sleep_streak(user_id)
+    sleep_status = get_sleep_log_for_date(user_id, today)
+    sleep_icon = "😴" if sched["enabled"] else ""
+
     reminders = get_user_reminders(user_id)[:3]
     reminder_lines = []
     for rid, text, next_run_iso, repeat_type in reminders:
@@ -698,6 +979,15 @@ async def today_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("▰" * min(10, int((today_ml / goal_ml) * 10)) + "▱" * (10 - min(10, int((today_ml / goal_ml) * 10))))
     lines.append("")
 
+    if sched["enabled"]:
+        ss, ws = sleep_status
+        sleep_done = ss == "ok" and ws == "ok"
+        lines.append(
+            f"<b>{sleep_icon} Сон {sched['sleep_time']}–{sched['wake_time']}</b> "
+            f"{'✅' if sleep_done else '⬜'} 🔥{sleep_streak}"
+        )
+        lines.append("")
+
     if habit_lines:
         lines.append(f"<b>🎯 Привычки ({len(habits) - pending}/{len(habits)}):</b>")
         lines.extend(habit_lines)
@@ -705,7 +995,7 @@ async def today_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("<b>🎯 Привычек пока нет</b>")
 
     if pending > 0:
-        lines.append(f"\n<i>Осталось отметить: {pending}</i>")
+        lines.append(f"\n<i>Осталось отметить привычек: {pending}</i>")
 
     if reminder_lines:
         lines.append("\n<b>⏰ Ближайшие напоминания:</b>")
@@ -718,8 +1008,6 @@ async def today_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_MENU)
 
-
-# ---------------------- ОБРАБОТЧИКИ: НАПОМИНАНИЯ ----------------------
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_from_update(update)
@@ -904,8 +1192,6 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------------- ОБРАБОТЧИКИ: ПРИВЫЧКИ ----------------------
-
 async def habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_from_update(update)
     query = update.callback_query
@@ -938,7 +1224,6 @@ async def habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         check = " ✅" if done_today else ""
         lines.append(f"{icon} <b>{name}</b>{fire}{check}")
 
-        # Кнопки отметки
         if habit_type == "good":
             btn = InlineKeyboardButton(f"✅ {name}", callback_data=f"logh_{hid}_done")
         else:
@@ -950,6 +1235,7 @@ async def habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🗑 Удалить", callback_data="habits_delete"),
         InlineKeyboardButton("📊 Статистика", callback_data="habits_stats"),
     ])
+    keyboard.append([InlineKeyboardButton("⚙️ Напоминания", callback_data="habits_reminders")])
     keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="menu")])
 
     text = "\n".join(lines)
@@ -1012,6 +1298,73 @@ async def habit_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")],
     ])
     await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def habit_reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    enabled, times = get_habit_reminder_settings(user_id)
+    times_str = ", ".join(times)
+
+    text = (
+        f"<b>⚙️ Напоминания о привычках</b>\n\n"
+        f"Статус: {'<b>включены</b>' if enabled else '<b>выключены</b>'}\n"
+        f"Время: <b>{times_str}</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔕 Выключить" if enabled else "🔔 Включить", callback_data="habits_rem_toggle")],
+        [InlineKeyboardButton("✏️ Изменить время", callback_data="habits_rem_times")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")],
+    ])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def habit_reminders_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    enabled, _ = get_habit_reminder_settings(user_id)
+    new_enabled = not enabled
+    set_habit_reminder_enabled(user_id, new_enabled)
+    schedule_habit_reminders(context.application, user_id, chat_id)
+    await habit_reminders_menu(update, context)
+
+
+async def habit_reminders_times_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Введите 3 времени напоминаний через запятую в формате <code>ЧЧ:ММ</code>:\n\n"
+        "Пример: <code>09:00, 13:00, 21:00</code>",
+        parse_mode="HTML",
+    )
+    return HR_TIMES
+
+
+async def habit_reminders_times_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    times = parse_time_list(text)
+    if len(times) < 1:
+        await update.message.reply_text(
+            "Неверный формат. Введите минимум одно время, например <code>09:00, 13:00, 21:00</code>:",
+            parse_mode="HTML",
+        )
+        return HR_TIMES
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    set_habit_reminder_times(user_id, times)
+    schedule_habit_reminders(context.application, user_id, chat_id)
+
+    await update.message.reply_text(
+        f"✅ Время напоминаний обновлено:\n<code>{', '.join(times)}</code>",
+        parse_mode="HTML",
+        reply_markup=MAIN_MENU,
+    )
+    return ConversationHandler.END
 
 
 async def add_habit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1097,8 +1450,10 @@ async def delete_habit_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     habit_id = int(data.split("_")[1])
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     if delete_habit(habit_id, user_id):
+        schedule_habit_reminders(context.application, user_id, chat_id)
         await query.edit_message_text("✅ Привычка удалена.")
     else:
         await query.edit_message_text("Не удалось удалить привычку.")
@@ -1112,7 +1467,208 @@ async def habit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------------- ОБРАБОТЧИКИ: ВОДА ----------------------
+async def hr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await back_to_menu(update, "Отменено")
+    return ConversationHandler.END
+
+
+async def sleep_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
+    query = update.callback_query
+    user_id = update.effective_user.id
+    sched = get_sleep_schedule(user_id)
+    streak = compute_sleep_streak(user_id)
+    today = date.today()
+    ss, ws = get_sleep_log_for_date(user_id, today)
+
+    status_line = ""
+    if sched["enabled"]:
+        if ss == "ok":
+            status_line += "😴 Вечер ✅ "
+        elif ss == "fail":
+            status_line += "😴 Вечер ❌ "
+        else:
+            status_line += "😴 Вечер ⬜ "
+
+        if ws == "ok":
+            status_line += "🌅 Утро ✅"
+        elif ws == "fail":
+            status_line += "🌅 Утро ❌"
+        else:
+            status_line += "🌅 Утро ⬜"
+
+    text = (
+        f"<b>😴 Режим сна</b>\n\n"
+        f"Отбой: <b>{sched['sleep_time']}</b>\n"
+        f"Подъём: <b>{sched['wake_time']}</b>\n"
+        f"Режим: {'<b>включён</b>' if sched['enabled'] else '<b>выключен</b>'}\n"
+        f"Напоминания: {'<b>включены</b>' if sched['reminder_enabled'] else '<b>выключены</b>'}\n"
+        f"🔥 Стрик: <b>{streak} дн.</b>\n"
+    )
+    if status_line:
+        text += f"\n{status_line}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Лёг вовремя", callback_data=f"sleep_log_{today.isoformat()}_sleep_ok")],
+        [InlineKeyboardButton("🌅 Встал вовремя", callback_data=f"sleep_log_{today.isoformat()}_wake_ok")],
+        [InlineKeyboardButton("❌ Не вовремя", callback_data=f"sleep_log_{today.isoformat()}_fail")],
+        [
+            InlineKeyboardButton("⚙️ Настроить", callback_data="sleep_configure"),
+            InlineKeyboardButton("📊 Статистика", callback_data="sleep_stats"),
+        ],
+        [
+            InlineKeyboardButton("🛑 Выключить режим" if sched["enabled"] else "▶️ Включить режим", callback_data="sleep_toggle"),
+            InlineKeyboardButton("🔕 Без напоминаний" if sched["reminder_enabled"] else "🔔 С напоминаниями", callback_data="sleep_rem_toggle"),
+        ],
+        [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
+    ])
+
+    if query:
+        await query.answer()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def sleep_log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    parts = data.split("_")
+    log_date = date.fromisoformat(parts[2])
+    action = parts[3]
+    result = parts[4] if len(parts) > 4 else None
+
+    user_id = update.effective_user.id
+
+    if action == "fail":
+        log_sleep(user_id, log_date, "sleep_status", "fail")
+        log_sleep(user_id, log_date, "wake_status", "fail")
+        await query.edit_message_text("❌ Отмечено: сегодня режим сна НЕ соблюдён.")
+        await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+        return
+
+    if action in ("sleep", "wake") and result in ("ok", "fail"):
+        field = "sleep_status" if action == "sleep" else "wake_status"
+        log_sleep(user_id, log_date, field, result)
+        label = "Лёг вовремя" if action == "sleep" else "Встал вовремя"
+        emoji = "✅" if result == "ok" else "❌"
+        await query.edit_message_text(f"{emoji} Отмечено: {label.lower()}.")
+        await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+
+
+async def sleep_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    logs = get_sleep_logs(user_id)
+    streak = compute_sleep_streak(user_id)
+
+    ok_days = sum(1 for _, s, w in logs if s == "ok" and w == "ok")
+    total = len(logs)
+    percent = round(ok_days / total * 100) if total else 0
+
+    lines = [
+        "<b>📊 Статистика сна</b>\n",
+        f"🔥 Текущий стрик: <b>{streak} дн.</b>",
+        f"Успешных дней: <b>{ok_days}/{total} ({percent}%)</b>",
+    ]
+
+    if logs:
+        lines.append("\nПоследние 7 дней:")
+        for d, s, w in logs[:7]:
+            if s == "ok" and w == "ok":
+                lines.append(f"{d} ✅")
+            elif s == "fail" or w == "fail":
+                lines.append(f"{d} ❌")
+            else:
+                lines.append(f"{d} ⬜")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Назад", callback_data="sleep_menu")],
+    ])
+    await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def sleep_configure_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Введите время отбоя в формате <code>ЧЧ:ММ</code>:\n\n"
+        "Пример: <code>23:00</code>",
+        parse_mode="HTML",
+    )
+    return S_SLEEP_TIME
+
+
+async def sleep_set_sleep_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", text):
+        await update.message.reply_text("Неверный формат. Введите время, например <code>23:00</code>:", parse_mode="HTML")
+        return S_SLEEP_TIME
+
+    context.user_data["sleep_time"] = text
+    await update.message.reply_text(
+        "Теперь введите время подъёма в формате <code>ЧЧ:ММ</code>:",
+        parse_mode="HTML",
+    )
+    return S_WAKE_TIME
+
+
+async def sleep_set_wake_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", text):
+        await update.message.reply_text("Неверный формат. Введите время, например <code>07:00</code>:", parse_mode="HTML")
+        return S_WAKE_TIME
+
+    sleep_time = context.user_data["sleep_time"]
+    wake_time = text
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    sched = get_sleep_schedule(user_id)
+    set_sleep_schedule(user_id, sleep_time, wake_time, enabled=True, reminder_enabled=sched["reminder_enabled"])
+    schedule_sleep_reminders(context.application, user_id, chat_id)
+
+    await update.message.reply_text(
+        f"✅ Режим сна установлен:\n"
+        f"😴 Отбой: <b>{sleep_time}</b>\n"
+        f"🌅 Подъём: <b>{wake_time}</b>\n\n"
+        f"Напоминания включены. Чтобы выключить — в меню сна.",
+        parse_mode="HTML",
+        reply_markup=MAIN_MENU,
+    )
+    return ConversationHandler.END
+
+
+async def sleep_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    sched = get_sleep_schedule(user_id)
+    new_enabled = not sched["enabled"]
+    set_sleep_schedule(user_id, sched["sleep_time"], sched["wake_time"], enabled=new_enabled, reminder_enabled=sched["reminder_enabled"])
+    schedule_sleep_reminders(context.application, user_id, chat_id)
+    await sleep_menu(update, context)
+
+
+async def sleep_reminder_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    sched = get_sleep_schedule(user_id)
+    new_rem = not sched["reminder_enabled"]
+    set_sleep_schedule(user_id, sched["sleep_time"], sched["wake_time"], enabled=sched["enabled"], reminder_enabled=new_rem)
+    schedule_sleep_reminders(context.application, user_id, chat_id)
+    await sleep_menu(update, context)
+
+
+async def sleep_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await back_to_menu(update, "Отменено")
+    return ConversationHandler.END
+
 
 async def water_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_from_update(update)
@@ -1237,14 +1793,11 @@ async def water_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------------- ЗАПУСК ----------------------
-
 def main():
     init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Напоминания
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
@@ -1278,7 +1831,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Привычки
     habit_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(add_habit_start, pattern="^habits_add$"),
@@ -1303,7 +1855,23 @@ def main():
         fallbacks=[CommandHandler("cancel", habit_cancel)],
     )
 
-    # Вода
+    habit_reminder_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(habit_reminders_times_start, pattern="^habits_rem_times$")],
+        states={
+            HR_TIMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, habit_reminders_times_set)],
+        },
+        fallbacks=[CommandHandler("cancel", hr_cancel)],
+    )
+
+    sleep_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(sleep_configure_start, pattern="^sleep_configure$")],
+        states={
+            S_SLEEP_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_set_sleep_time)],
+            S_WAKE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_set_wake_time)],
+        },
+        fallbacks=[CommandHandler("cancel", sleep_cancel)],
+    )
+
     water_goal_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(water_goal_start, pattern="^water_goal$")],
         states={
@@ -1312,14 +1880,14 @@ def main():
         fallbacks=[CommandHandler("cancel", water_cancel)],
     )
 
-    # Conversation handlers должны быть первыми, чтобы перехватывать свои callback'и
     application.add_handler(add_conv)
     application.add_handler(delete_conv)
     application.add_handler(habit_conv)
     application.add_handler(delete_habit_conv)
+    application.add_handler(habit_reminder_conv)
+    application.add_handler(sleep_conv)
     application.add_handler(water_goal_conv)
 
-    # Reply-кнопки главного меню
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", list_reminders))
@@ -1327,16 +1895,23 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^📅 Сегодня$"), today_dashboard))
     application.add_handler(MessageHandler(filters.Regex("^🎯 Привычки$"), habits_menu))
     application.add_handler(MessageHandler(filters.Regex("^💧 Вода$"), water_menu))
+    application.add_handler(MessageHandler(filters.Regex("^😴 Сон$"), sleep_menu))
     application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), list_reminders))
     application.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_command))
 
-    # Callback-обработчики вне диалогов
     application.add_handler(CallbackQueryHandler(habits_menu, pattern="^habits_menu$"))
     application.add_handler(CallbackQueryHandler(habit_stats, pattern="^habits_stats$"))
+    application.add_handler(CallbackQueryHandler(habit_reminders_menu, pattern="^habits_reminders$"))
+    application.add_handler(CallbackQueryHandler(habit_reminders_toggle, pattern="^habits_rem_toggle$"))
     application.add_handler(CallbackQueryHandler(log_habit_handler, pattern="^logh_\\d+_(done|not_done)$"))
     application.add_handler(CallbackQueryHandler(water_menu, pattern="^water_menu$"))
     application.add_handler(CallbackQueryHandler(water_add_handler, pattern="^water_\\d+$"))
     application.add_handler(CallbackQueryHandler(water_stats, pattern="^water_stats$"))
+    application.add_handler(CallbackQueryHandler(sleep_menu, pattern="^sleep_menu$"))
+    application.add_handler(CallbackQueryHandler(sleep_log_handler, pattern="^sleep_log_\\d{4}-\\d{2}-\\d{2}_(sleep|wake|fail)_(ok|fail)?$"))
+    application.add_handler(CallbackQueryHandler(sleep_stats, pattern="^sleep_stats$"))
+    application.add_handler(CallbackQueryHandler(sleep_toggle, pattern="^sleep_toggle$"))
+    application.add_handler(CallbackQueryHandler(sleep_reminder_toggle, pattern="^sleep_rem_toggle$"))
     application.add_handler(CallbackQueryHandler(start, pattern="^menu$"))
 
     scheduler.start()
@@ -1344,6 +1919,7 @@ def main():
     async def post_init(app: Application):
         await load_reminders_to_scheduler(app)
         await load_habit_reminders(app)
+        await load_sleep_reminders(app)
 
     application.post_init = post_init
 
