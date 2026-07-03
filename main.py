@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # ---------------------- НАСТРОЙКИ ----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -42,15 +43,17 @@ TZ = pytz.timezone(DEFAULT_TIMEZONE)
 # Состояния диалогов
 R_TEXT, R_CHOOSE_TIME, R_CUSTOM_TIME, R_REPEAT = range(4)
 H_NAME, H_TYPE = range(4, 6)
-W_AMOUNT, W_GOAL = range(6, 8)
+W_CUSTOM_AMOUNT, W_GOAL = range(6, 8)
+
+HABIT_REMINDER_TIMES = [(9, 0), (21, 0)]
 
 # ---------------------- КЛАВИАТУРЫ ----------------------
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
+        ["🎯 Привычки", "💧 Вода", "📅 Сегодня"],
         ["➕ Напоминание", "📋 Мои напоминания"],
-        ["🗑 Удалить напоминание", "🎯 Привычки"],
-        ["💧 Вода", "❓ Помощь"],
+        ["🗑 Удалить напоминание", "❓ Помощь"],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
@@ -70,7 +73,7 @@ def reminder_time_keyboard():
             InlineKeyboardButton("12 часов", callback_data="time_720"),
         ],
         [InlineKeyboardButton("📅 Своё время", callback_data="time_custom")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
     ])
 
 
@@ -80,7 +83,7 @@ def repeat_keyboard():
         [InlineKeyboardButton("Ежедневно", callback_data="daily")],
         [InlineKeyboardButton("Еженедельно", callback_data="weekly")],
         [InlineKeyboardButton("Ежемесячно", callback_data="monthly")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
     ])
 
 
@@ -88,22 +91,7 @@ def habit_type_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👍 Полезная", callback_data="good")],
         [InlineKeyboardButton("🚫 Вредная", callback_data="bad")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
-    ])
-
-
-def water_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("200 мл", callback_data="water_200"),
-            InlineKeyboardButton("300 мл", callback_data="water_300"),
-        ],
-        [
-            InlineKeyboardButton("500 мл", callback_data="water_500"),
-            InlineKeyboardButton("750 мл", callback_data="water_750"),
-        ],
-        [InlineKeyboardButton("💧 Своё количество", callback_data="water_custom")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
     ])
 
 
@@ -120,6 +108,16 @@ REPEAT_LABELS = {
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
 
     c.execute(
         """
@@ -183,6 +181,34 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+# ---------- Users ----------
+
+def ensure_user(user_id: int, chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO users (user_id, chat_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id, updated_at=excluded.updated_at
+        """,
+        (user_id, chat_id, datetime.now(pytz.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_users_with_habits():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT DISTINCT h.user_id, u.chat_id FROM habits h JOIN users u ON h.user_id = u.user_id"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 
 # ---------- Reminders ----------
@@ -271,6 +297,15 @@ def get_user_habits(user_id: int):
     return rows
 
 
+def get_habit(habit_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, name, habit_type FROM habits WHERE id = ?", (habit_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
 def delete_habit(habit_id: int, user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -310,8 +345,19 @@ def get_habit_logs(habit_id: int):
     return rows
 
 
+def get_habit_log_for_date(habit_id: int, log_date: date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT status FROM habit_logs WHERE habit_id = ? AND log_date = ?",
+        (habit_id, log_date.isoformat()),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def compute_streak(habit_type: str, logs: list) -> int:
-    """Считает подряд идущие дни с нужным статусом, начиная со вчера/сегодня."""
     if not logs:
         return 0
 
@@ -322,7 +368,6 @@ def compute_streak(habit_type: str, logs: list) -> int:
     streak = 0
     check_day = today
 
-    # Если сегодня ещё не отмечено — начинаем со вчера
     if not dates.get(check_day, False):
         check_day = today - timedelta(days=1)
 
@@ -331,6 +376,17 @@ def compute_streak(habit_type: str, logs: list) -> int:
         check_day -= timedelta(days=1)
 
     return streak
+
+
+def compute_habit_stats(habit_type: str, logs: list, days: int = 30) -> tuple:
+    """Возвращает (успешных дней, всего дней с логами, процент)."""
+    status_needed = "done" if habit_type == "good" else "not_done"
+    cutoff = date.today() - timedelta(days=days - 1)
+    filtered = [(d, s) for d, s in logs if date.fromisoformat(d) >= cutoff]
+    total = len(filtered)
+    success = sum(1 for _, s in filtered if s == status_needed)
+    percent = round(success / total * 100) if total else 0
+    return success, total, percent
 
 
 # ---------- Water ----------
@@ -486,10 +542,70 @@ async def load_reminders_to_scheduler(app: Application):
     logger.info(f"Загружено напоминаний из БД: {len(rows)}")
 
 
+# ---------- Habit reminders ----------
+
+async def send_habit_reminder_job(context, application: Application):
+    job = context.job
+    user_id = job.data["user_id"]
+    chat_id = job.data["chat_id"]
+
+    habits = get_user_habits(user_id)
+    if not habits:
+        return
+
+    # Собираем привычки без отметки сегодня
+    pending_good = []
+    pending_bad = []
+    for hid, name, habit_type in habits:
+        status = get_habit_log_for_date(hid, date.today())
+        if status:
+            continue
+        if habit_type == "good":
+            pending_good.append(name)
+        else:
+            pending_bad.append(name)
+
+    if not pending_good and not pending_bad:
+        return
+
+    lines = ["⏰ Время отметить привычки!\n"]
+    if pending_good:
+        lines.append("👍 Полезные:")
+        lines.extend(f"• {n}" for n in pending_good)
+    if pending_bad:
+        lines.append("\n🚫 Вредные (отметь, что сдержался):")
+        lines.extend(f"• {n}" for n in pending_bad)
+    lines.append("\n👉 Нажми 🎯 Привычки")
+
+    try:
+        await application.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        logger.error(f"Ошибка отправки напоминания о привычках {user_id}: {e}")
+
+
+def schedule_habit_reminders(app: Application, user_id: int, chat_id: int):
+    for i, (hour, minute) in enumerate(HABIT_REMINDER_TIMES):
+        job_id = f"habit_reminder_{user_id}_{i}"
+        scheduler.add_job(
+            send_habit_reminder_job,
+            trigger=CronTrigger(hour=hour, minute=minute),
+            id=job_id,
+            replace_existing=True,
+            args=[app],
+            data={"user_id": user_id, "chat_id": chat_id},
+        )
+
+
+async def load_habit_reminders(app: Application):
+    rows = get_users_with_habits()
+    for user_id, chat_id in rows:
+        schedule_habit_reminders(app, user_id, chat_id)
+    logger.info(f"Загружено напоминаний о привычках для {len(rows)} пользователей")
+
+
 # ---------------------- УТИЛИТЫ ----------------------
 
-async def return_to_menu(update: Update, text: str):
-    """Отправляет сообщение с главным меню, убирая inline-кнопки."""
+async def back_to_menu(update: Update, text: str):
     if update.callback_query:
         await update.callback_query.answer()
         try:
@@ -501,13 +617,17 @@ async def return_to_menu(update: Update, text: str):
         await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 
-def menu_back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="menu")]])
+async def ensure_user_from_update(update: Update):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    ensure_user(user_id, chat_id)
+    return user_id, chat_id
 
 
-# ---------------------- ОБРАБОТЧИКИ: НАПОМИНАНИЯ ----------------------
+# ---------------------- ОБРАБОТЧИКИ: ГЛАВНОЕ МЕНЮ ----------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     await update.message.reply_text(
         "Привет! Я твой помощник: напоминания, привычки и трекер воды.\n\n"
         "Всё управление — кнопками ниже 👇",
@@ -522,12 +642,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📋 Мои напоминания — список\n"
         "• 🗑 Удалить напоминание\n\n"
         "<b>Привычки</b>\n"
-        "• 👍 Полезные — отмечай, что сделал\n"
-        "• 🚫 Вредные — отмечай, что НЕ делал\n"
-        "• 🔥 Стрик покажет, сколько дней подряд\n\n"
+        "• 🎯 Привычки — сразу открывает список с кнопками отметки\n"
+        "• 👍 Полезные — жми ✅\n"
+        "• 🚫 Вредные — жми 🔥 Держусь\n"
+        "• Автоматические напоминания: 9:00 и 21:00\n\n"
         "<b>Вода</b>\n"
-        "• 💧 Вода — быстро добавить выпитое\n"
-        "• Цель по умолчанию — 2000 мл\n\n"
+        "• 💧 Вода — быстро добавить +200/+300/+500 мл\n"
+        "• 📅 Сегодня — дашборд дня\n\n"
         f"Часовой пояс: <b>{DEFAULT_TIMEZONE}</b>"
     )
     if update.callback_query:
@@ -537,9 +658,71 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
-# ---------- Добавление напоминания ----------
+async def today_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
+    user_id = update.effective_user.id
+
+    # Привычки
+    habits = get_user_habits(user_id)
+    today = date.today()
+    habit_lines = []
+    pending = 0
+    for hid, name, habit_type in habits:
+        status = get_habit_log_for_date(hid, today)
+        if status:
+            if habit_type == "good":
+                habit_lines.append(f"✅ {name}")
+            else:
+                habit_lines.append(f"🔥 {name}")
+        else:
+            pending += 1
+            if habit_type == "good":
+                habit_lines.append(f"⬜ {name}")
+            else:
+                habit_lines.append(f"⬜ {name} (сдержаться)")
+
+    # Вода
+    today_ml = get_water_today(user_id)
+    goal_ml = get_water_goal(user_id)
+
+    # Напоминания
+    reminders = get_user_reminders(user_id)[:3]
+    reminder_lines = []
+    for rid, text, next_run_iso, repeat_type in reminders:
+        next_run = datetime.fromisoformat(next_run_iso).astimezone(TZ)
+        reminder_lines.append(f"• {text} — {next_run.strftime('%d.%m %H:%M')}")
+
+    lines = [f"<b>📅 Сегодня, {today.strftime('%d.%m.%Y')}</b>\n"]
+
+    lines.append(f"<b>💧 Вода: {today_ml} / {goal_ml} мл</b>")
+    lines.append("▰" * min(10, int((today_ml / goal_ml) * 10)) + "▱" * (10 - min(10, int((today_ml / goal_ml) * 10))))
+    lines.append("")
+
+    if habit_lines:
+        lines.append(f"<b>🎯 Привычки ({len(habits) - pending}/{len(habits)}):</b>")
+        lines.extend(habit_lines)
+    else:
+        lines.append("<b>🎯 Привычек пока нет</b>")
+
+    if pending > 0:
+        lines.append(f"\n<i>Осталось отметить: {pending}</i>")
+
+    if reminder_lines:
+        lines.append("\n<b>⏰ Ближайшие напоминания:</b>")
+        lines.extend(reminder_lines)
+
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_MENU)
+
+
+# ---------------------- ОБРАБОТЧИКИ: НАПОМИНАНИЯ ----------------------
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     await update.message.reply_text(
         "Введите текст напоминания:",
         reply_markup=ReplyKeyboardRemove(),
@@ -561,8 +744,8 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "cancel":
-        await return_to_menu(update, "Отменено.")
+    if data == "menu":
+        await back_to_menu(update, "Главное меню")
         return ConversationHandler.END
 
     if data == "time_custom":
@@ -619,8 +802,8 @@ async def add_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        await return_to_menu(update, "Отменено.")
+    if query.data == "menu":
+        await back_to_menu(update, "Главное меню")
         return ConversationHandler.END
 
     repeat_type = query.data
@@ -644,13 +827,12 @@ async def add_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await return_to_menu(update, "Отменено.")
+    await back_to_menu(update, "Отменено")
     return ConversationHandler.END
 
 
-# ---------- Список и удаление ----------
-
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     user_id = update.effective_user.id
     rows = get_user_reminders(user_id)
     if not rows:
@@ -670,6 +852,7 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     user_id = update.effective_user.id
     rows = get_user_reminders(user_id)
     if not rows:
@@ -683,7 +866,7 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for rid, text, _, _ in rows:
         label = f"#{rid}: {text[:30]}{'...' if len(text) > 30 else ''}"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"delr_{rid}")])
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="menu")])
 
     await update.message.reply_text(
         "Выберите напоминание для удаления:",
@@ -697,8 +880,8 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "cancel":
-        await return_to_menu(update, "Отменено.")
+    if data == "menu":
+        await back_to_menu(update, "Главное меню")
         return ConversationHandler.END
 
     if not data.startswith("delr_"):
@@ -724,39 +907,22 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------- ОБРАБОТЧИКИ: ПРИВЫЧКИ ----------------------
 
 async def habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     query = update.callback_query
-    if query:
-        await query.answer()
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Мои привычки", callback_data="habits_list")],
-        [InlineKeyboardButton("➕ Добавить привычку", callback_data="habits_add")],
-        [InlineKeyboardButton("🗑 Удалить привычку", callback_data="habits_delete")],
-        [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
-    ])
-
-    text = "<b>🎯 Привычки</b>\n\nЗдесь можно отслеживать полезные и вредные привычки."
-    if query:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
-    else:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
-
-
-async def habits_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
     user_id = update.effective_user.id
     habits = get_user_habits(user_id)
 
     if not habits:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Добавить привычку", callback_data="habits_add")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")],
+            [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
         ])
-        await query.edit_message_text(
-            "У вас пока нет привычек.",
-            reply_markup=keyboard,
-        )
+        text = "У вас пока нет привычек. Добавьте первую!"
+        if query:
+            await query.answer()
+            await query.edit_message_text(text, reply_markup=keyboard)
+        else:
+            await update.message.reply_text(text, reply_markup=keyboard)
         return
 
     lines = ["<b>🎯 Твои привычки</b>\n"]
@@ -765,25 +931,33 @@ async def habits_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logs = get_habit_logs(hid)
         streak = compute_streak(habit_type, logs)
         icon = "👍" if habit_type == "good" else "🚫"
+        today_status = get_habit_log_for_date(hid, date.today())
+        done_today = bool(today_status)
+
         fire = f" 🔥{streak}" if streak > 0 else ""
-        lines.append(f"{icon} <b>{name}</b>{fire}")
+        check = " ✅" if done_today else ""
+        lines.append(f"{icon} <b>{name}</b>{fire}{check}")
 
-        # Кнопка отметки
+        # Кнопки отметки
         if habit_type == "good":
-            btn_text = f"✅ {name}"
-            btn_data = f"logh_{hid}_done"
+            btn = InlineKeyboardButton(f"✅ {name}", callback_data=f"logh_{hid}_done")
         else:
-            btn_text = f"🙅 Не {name}"
-            btn_data = f"logh_{hid}_not_done"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=btn_data)])
+            btn = InlineKeyboardButton(f"🔥 Держусь", callback_data=f"logh_{hid}_not_done")
+        keyboard.append([btn])
 
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")])
+    keyboard.append([InlineKeyboardButton("➕ Добавить", callback_data="habits_add")])
+    keyboard.append([
+        InlineKeyboardButton("🗑 Удалить", callback_data="habits_delete"),
+        InlineKeyboardButton("📊 Статистика", callback_data="habits_stats"),
+    ])
+    keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="menu")])
 
-    await query.edit_message_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    text = "\n".join(lines)
+    if query:
+        await query.answer()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def log_habit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -797,15 +971,47 @@ async def log_habit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     log_habit(habit_id, today, status)
 
-    habit = get_user_habits(update.effective_user.id)
-    name = next((h[1] for h in habit if h[0] == habit_id), "Привычка")
-
-    if status == "done":
-        await query.edit_message_text(f"✅ Отмечено: <b>{name}</b>", parse_mode="HTML")
+    habit = get_habit(habit_id)
+    if habit:
+        name = habit[2]
+        habit_type = habit[3]
+        logs = get_habit_logs(habit_id)
+        streak = compute_streak(habit_type, logs)
+        if habit_type == "good":
+            msg = f"✅ Отмечено: <b>{name}</b>\n🔥 Стрик: {streak} дн."
+        else:
+            msg = f"🔥 Сдержался: <b>{name}</b>\nСтрик: {streak} дн."
+        await query.edit_message_text(msg, parse_mode="HTML")
+        await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
     else:
-        await query.edit_message_text(f"🙅 Отмечено: сегодня <b>НЕ {name}</b>", parse_mode="HTML")
+        await query.edit_message_text("Привычка не найдена.")
 
-    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+
+async def habit_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    habits = get_user_habits(user_id)
+
+    if not habits:
+        await query.edit_message_text("У вас пока нет привычек.")
+        return
+
+    lines = ["<b>📊 Статистика привычек (30 дней)</b>\n"]
+    for hid, name, habit_type in habits:
+        logs = get_habit_logs(hid)
+        streak = compute_streak(habit_type, logs)
+        success, total, percent = compute_habit_stats(habit_type, logs, 30)
+        icon = "👍" if habit_type == "good" else "🚫"
+        lines.append(
+            f"{icon} <b>{name}</b>\n"
+            f"   🔥 Стрик: {streak} дн. | {success}/{total} ({percent}%)\n"
+        )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")],
+    ])
+    await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
 
 
 async def add_habit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -813,7 +1019,7 @@ async def add_habit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await query.edit_message_text(
         "Введите название привычки:\n\n"
-        "Например: <code>Зарядка</code> или <code>Пить пиво</code>",
+        "Например: <code>Зарядка</code> или <code>Алкоголь</code>",
         parse_mode="HTML",
     )
     return H_NAME
@@ -832,15 +1038,18 @@ async def add_habit_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        await return_to_menu(update, "Отменено.")
+    if query.data == "menu":
+        await back_to_menu(update, "Главное меню")
         return ConversationHandler.END
 
     habit_type = query.data
     name = context.user_data["habit_name"]
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-    add_habit(user_id, name, habit_type)
+    habit_id = add_habit(user_id, name, habit_type)
+    schedule_habit_reminders(context.application, user_id, chat_id)
+
     type_label = "полезная" if habit_type == "good" else "вредная"
     await query.edit_message_text(f"✅ Добавлена {type_label} привычка: <b>{name}</b>", parse_mode="HTML")
     await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
@@ -855,7 +1064,7 @@ async def delete_habit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not habits:
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Добавить привычку", callback_data="habits_add")],
+            [InlineKeyboardButton("➕ Добавить", callback_data="habits_add")],
             [InlineKeyboardButton("🔙 Назад", callback_data="habits_menu")],
         ])
         await query.edit_message_text("У вас пока нет привычек для удаления.", reply_markup=keyboard)
@@ -865,7 +1074,7 @@ async def delete_habit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton(f"{h[1]} ({'👍' if h[2] == 'good' else '🚫'})", callback_data=f"delh_{h[0]}")]
         for h in habits
     ]
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="menu")])
 
     await query.edit_message_text(
         "Выберите привычку для удаления:",
@@ -879,8 +1088,8 @@ async def delete_habit_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     data = query.data
 
-    if data == "cancel":
-        await return_to_menu(update, "Отменено.")
+    if data == "menu":
+        await back_to_menu(update, "Главное меню")
         return ConversationHandler.END
 
     if not data.startswith("delh_"):
@@ -899,65 +1108,57 @@ async def delete_habit_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def habit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await return_to_menu(update, "Отменено.")
+    await back_to_menu(update, "Отменено")
     return ConversationHandler.END
 
 
 # ---------------------- ОБРАБОТЧИКИ: ВОДА ----------------------
 
 async def water_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_from_update(update)
     query = update.callback_query
-    if query:
-        await query.answer()
-
     user_id = update.effective_user.id
     today_ml = get_water_today(user_id)
     goal_ml = get_water_goal(user_id)
+    remaining = max(0, goal_ml - today_ml)
+    percent = min(100, int((today_ml / goal_ml) * 100)) if goal_ml else 0
+
+    bar = "▰" * (percent // 10) + "▱" * (10 - percent // 10)
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить воду", callback_data="water_add")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="water_stats")],
-        [InlineKeyboardButton("🎯 Цель: " + str(goal_ml) + " мл", callback_data="water_goal")],
+        [
+            InlineKeyboardButton("+200", callback_data="water_200"),
+            InlineKeyboardButton("+300", callback_data="water_300"),
+            InlineKeyboardButton("+500", callback_data="water_500"),
+        ],
+        [
+            InlineKeyboardButton("📊 Статистика", callback_data="water_stats"),
+            InlineKeyboardButton("🎯 Цель", callback_data="water_goal"),
+        ],
         [InlineKeyboardButton("🔙 В меню", callback_data="menu")],
     ])
 
     text = (
         f"<b>💧 Вода сегодня</b>\n\n"
         f"Выпито: <b>{today_ml} мл</b> из {goal_ml} мл\n"
-        f"Осталось: <b>{max(0, goal_ml - today_ml)} мл</b>"
+        f"Осталось: <b>{remaining} мл</b>\n"
+        f"{bar} {percent}%"
     )
     if query:
+        await query.answer()
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
-async def water_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "Выберите сколько воды выпили:",
-        reply_markup=water_keyboard(),
-    )
-    return W_AMOUNT
-
-
-async def water_add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def water_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "cancel":
-        await return_to_menu(update, "Отменено.")
-        return ConversationHandler.END
-
-    if data == "water_custom":
-        await query.edit_message_text(
-            "Введите количество воды в миллилитрах:\n"
-            "Например: <code>350</code>",
-            parse_mode="HTML",
-        )
-        return W_AMOUNT
+    if data == "menu":
+        await back_to_menu(update, "Главное меню")
+        return
 
     if data.startswith("water_"):
         amount = int(data.split("_")[1])
@@ -965,42 +1166,16 @@ async def water_add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_water(user_id, amount)
         today_ml = get_water_today(user_id)
         goal_ml = get_water_goal(user_id)
+        percent = min(100, int((today_ml / goal_ml) * 100)) if goal_ml else 0
+        bar = "▰" * (percent // 10) + "▱" * (10 - percent // 10)
 
         await query.edit_message_text(
             f"✅ Добавлено <b>{amount} мл</b>\n\n"
-            f"Сегодня: <b>{today_ml} мл</b> из {goal_ml} мл",
+            f"Сегодня: <b>{today_ml} мл</b> из {goal_ml} мл\n"
+            f"{bar} {percent}%",
             parse_mode="HTML",
         )
         await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-
-    return W_AMOUNT
-
-
-async def water_add_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        amount = int(text)
-    except ValueError:
-        await update.message.reply_text("Введите число, например <code>350</code>:", parse_mode="HTML")
-        return W_AMOUNT
-
-    if amount <= 0 or amount > 10000:
-        await update.message.reply_text("Введите разумное число от 1 до 10000 мл:")
-        return W_AMOUNT
-
-    user_id = update.effective_user.id
-    add_water(user_id, amount)
-    today_ml = get_water_today(user_id)
-    goal_ml = get_water_goal(user_id)
-
-    await update.message.reply_text(
-        f"✅ Добавлено <b>{amount} мл</b>\n\n"
-        f"Сегодня: <b>{today_ml} мл</b> из {goal_ml} мл",
-        parse_mode="HTML",
-        reply_markup=MAIN_MENU,
-    )
-    return ConversationHandler.END
 
 
 async def water_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1010,9 +1185,9 @@ async def water_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goal_ml = get_water_goal(user_id)
     stats = get_water_stats(user_id, days=7)
 
-    lines = ["<b>📊 Вода за последние 7 дней</b>\n"]
+    lines = ["<b>📊 Вода за 7 дней</b>\n"]
     for d, amount in stats:
-        bar = "█" * int((amount / goal_ml) * 10) if goal_ml else ""
+        bar = "▰" * min(10, int((amount / goal_ml) * 10)) if goal_ml else ""
         lines.append(f"{d}: <b>{amount} мл</b> {bar}")
 
     if not stats:
@@ -1058,7 +1233,7 @@ async def water_goal_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def water_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await return_to_menu(update, "Отменено.")
+    await back_to_menu(update, "Отменено")
     return ConversationHandler.END
 
 
@@ -1079,12 +1254,12 @@ def main():
             R_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_text)],
             R_CHOOSE_TIME: [
                 CallbackQueryHandler(choose_time, pattern="^time_(5|10|30|120|360|720|custom)$"),
-                CallbackQueryHandler(cancel, pattern="^cancel$"),
+                CallbackQueryHandler(cancel, pattern="^menu$"),
             ],
             R_CUSTOM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_time)],
             R_REPEAT: [
                 CallbackQueryHandler(add_repeat, pattern="^(none|daily|weekly|monthly)$"),
-                CallbackQueryHandler(cancel, pattern="^cancel$"),
+                CallbackQueryHandler(cancel, pattern="^menu$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1097,7 +1272,7 @@ def main():
         ],
         states={
             "CHOOSE_DELETE_REMINDER": [
-                CallbackQueryHandler(delete_confirm, pattern="^(delr_\\d+|cancel)$"),
+                CallbackQueryHandler(delete_confirm, pattern="^(delr_\\d+|menu)$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1106,15 +1281,13 @@ def main():
     # Привычки
     habit_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("habits", habits_menu),
-            MessageHandler(filters.Regex("^🎯 Привычки$"), habits_menu),
             CallbackQueryHandler(add_habit_start, pattern="^habits_add$"),
         ],
         states={
             H_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_habit_name)],
             H_TYPE: [
                 CallbackQueryHandler(add_habit_type, pattern="^(good|bad)$"),
-                CallbackQueryHandler(habit_cancel, pattern="^cancel$"),
+                CallbackQueryHandler(habit_cancel, pattern="^menu$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", habit_cancel)],
@@ -1124,28 +1297,13 @@ def main():
         entry_points=[CallbackQueryHandler(delete_habit_start, pattern="^habits_delete$")],
         states={
             "CHOOSE_DELETE_HABIT": [
-                CallbackQueryHandler(delete_habit_confirm, pattern="^(delh_\\d+|cancel)$"),
+                CallbackQueryHandler(delete_habit_confirm, pattern="^(delh_\\d+|menu)$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", habit_cancel)],
     )
 
     # Вода
-    water_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("water", water_menu),
-            MessageHandler(filters.Regex("^💧 Вода$"), water_menu),
-            CallbackQueryHandler(water_add_start, pattern="^water_add$"),
-        ],
-        states={
-            W_AMOUNT: [
-                CallbackQueryHandler(water_add_amount, pattern="^(water_\\d+|water_custom|cancel)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, water_add_custom_text),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", water_cancel)],
-    )
-
     water_goal_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(water_goal_start, pattern="^water_goal$")],
         states={
@@ -1154,31 +1312,40 @@ def main():
         fallbacks=[CommandHandler("cancel", water_cancel)],
     )
 
-    # Callback-обработчики вне ConversationHandler
-    application.add_handler(CallbackQueryHandler(habits_menu, pattern="^habits_menu$"))
-    application.add_handler(CallbackQueryHandler(habits_list, pattern="^habits_list$"))
-    application.add_handler(CallbackQueryHandler(log_habit_handler, pattern="^logh_\\d+_(done|not_done)$"))
-    application.add_handler(CallbackQueryHandler(water_menu, pattern="^water_menu$"))
-    application.add_handler(CallbackQueryHandler(water_stats, pattern="^water_stats$"))
-    application.add_handler(CallbackQueryHandler(start, pattern="^menu$"))
-
-    # Команды и reply-кнопки
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("list", list_reminders))
-    application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), list_reminders))
-    application.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_command))
-
-    # Conversation handlers
+    # Conversation handlers должны быть первыми, чтобы перехватывать свои callback'и
     application.add_handler(add_conv)
     application.add_handler(delete_conv)
     application.add_handler(habit_conv)
     application.add_handler(delete_habit_conv)
-    application.add_handler(water_conv)
     application.add_handler(water_goal_conv)
 
+    # Reply-кнопки главного меню
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("list", list_reminders))
+    application.add_handler(CommandHandler("today", today_dashboard))
+    application.add_handler(MessageHandler(filters.Regex("^📅 Сегодня$"), today_dashboard))
+    application.add_handler(MessageHandler(filters.Regex("^🎯 Привычки$"), habits_menu))
+    application.add_handler(MessageHandler(filters.Regex("^💧 Вода$"), water_menu))
+    application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), list_reminders))
+    application.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_command))
+
+    # Callback-обработчики вне диалогов
+    application.add_handler(CallbackQueryHandler(habits_menu, pattern="^habits_menu$"))
+    application.add_handler(CallbackQueryHandler(habit_stats, pattern="^habits_stats$"))
+    application.add_handler(CallbackQueryHandler(log_habit_handler, pattern="^logh_\\d+_(done|not_done)$"))
+    application.add_handler(CallbackQueryHandler(water_menu, pattern="^water_menu$"))
+    application.add_handler(CallbackQueryHandler(water_add_handler, pattern="^water_\\d+$"))
+    application.add_handler(CallbackQueryHandler(water_stats, pattern="^water_stats$"))
+    application.add_handler(CallbackQueryHandler(start, pattern="^menu$"))
+
     scheduler.start()
-    application.post_init = load_reminders_to_scheduler
+
+    async def post_init(app: Application):
+        await load_reminders_to_scheduler(app)
+        await load_habit_reminders(app)
+
+    application.post_init = post_init
 
     logger.info("Бот запущен")
     application.run_polling()
