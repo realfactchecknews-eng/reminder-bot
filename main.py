@@ -3,7 +3,14 @@ import logging
 import sqlite3
 import pytz
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from dateutil.relativedelta import relativedelta
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,7 +22,6 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
-from apscheduler.triggers.cron import CronTrigger
 
 # ---------------------- НАСТРОЙКИ ----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -32,7 +38,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Состояния диалога добавления напоминания
-TEXT, DATETIME, REPEAT = range(3)
+TEXT, CHOOSE_TIME, CUSTOM_TIME, REPEAT = range(4)
+
+TZ = pytz.timezone(DEFAULT_TIMEZONE)
+
+# ---------------------- КЛАВИАТУРЫ ----------------------
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        ["➕ Добавить напоминание", "📋 Мои напоминания"],
+        ["🗑 Удалить напоминание", "❓ Помощь"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+
+def time_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5 мин", callback_data="time_5"),
+            InlineKeyboardButton("10 мин", callback_data="time_10"),
+            InlineKeyboardButton("30 мин", callback_data="time_30"),
+        ],
+        [
+            InlineKeyboardButton("2 часа", callback_data="time_120"),
+            InlineKeyboardButton("6 часов", callback_data="time_360"),
+            InlineKeyboardButton("12 часов", callback_data="time_720"),
+        ],
+        [InlineKeyboardButton("📅 Своё время", callback_data="time_custom")],
+    ])
+
+
+def repeat_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Разово", callback_data="none")],
+        [InlineKeyboardButton("Ежедневно", callback_data="daily")],
+        [InlineKeyboardButton("Еженедельно", callback_data="weekly")],
+        [InlineKeyboardButton("Ежемесячно", callback_data="monthly")],
+    ])
+
+
+REPEAT_LABELS = {
+    "none": "разово",
+    "daily": "ежедневно",
+    "weekly": "еженедельно",
+    "monthly": "ежемесячно",
+}
+
 
 # ---------------------- БАЗА ДАННЫХ ----------------------
 
@@ -81,6 +134,15 @@ def get_user_reminders(user_id: int):
     return rows
 
 
+def get_reminder(reminder_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, chat_id, text, next_run, repeat_type FROM reminders WHERE id = ?", (reminder_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
 def delete_reminder(reminder_id: int, user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -113,21 +175,17 @@ scheduler = AsyncIOScheduler(timezone=DEFAULT_TIMEZONE)
 
 
 def compute_next_run(repeat_type: str, base: datetime) -> datetime | None:
-    tz = pytz.timezone(DEFAULT_TIMEZONE)
     if repeat_type == "daily":
         return base + timedelta(days=1)
     if repeat_type == "weekly":
         return base + timedelta(weeks=1)
     if repeat_type == "monthly":
-        # приблизительно +1 месяц
-        try:
-            return base.replace(month=base.month + 1)
-        except ValueError:
-            return base.replace(month=1, year=base.year + 1)
+        return base + relativedelta(months=1)
     return None
 
 
-async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+async def send_reminder_job(context, application: Application):
+    """APScheduler job. context — это apscheduler JobExecutionContext."""
     job = context.job
     reminder_id = job.data["reminder_id"]
     chat_id = job.data["chat_id"]
@@ -135,7 +193,7 @@ async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     repeat_type = job.data["repeat_type"]
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание:\n{text}")
+        await application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание:\n{text}")
     except Exception as e:
         logger.error(f"Ошибка отправки напоминания {reminder_id}: {e}")
         return
@@ -144,35 +202,34 @@ async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         delete_reminder_by_id(reminder_id)
         return
 
-    # Для повторяющихся пересчитываем следующий запуск
-    now = datetime.now(pytz.timezone(DEFAULT_TIMEZONE))
-    next_run = compute_next_run(repeat_type, now)
-    if next_run:
-        update_next_run(reminder_id, next_run)
-        schedule_reminder(
-            context.application,
-            reminder_id,
-            chat_id,
-            text,
-            next_run,
-            repeat_type,
-        )
+    # Для повторяющихся пересчитываем следующий запуск от последнего next_run
+    row = get_reminder(reminder_id)
+    if not row:
+        return
+    _, _, _, _, next_run_iso, _ = row
+    last_run = datetime.fromisoformat(next_run_iso)
+    next_run = compute_next_run(repeat_type, last_run)
+    if not next_run:
+        return
+    update_next_run(reminder_id, next_run)
+    schedule_reminder(application, reminder_id, chat_id, text, next_run, repeat_type)
 
 
 def schedule_reminder(app: Application, reminder_id: int, chat_id: int, text: str, run_time: datetime, repeat_type: str):
-    job_id = f"reminder_{reminder_id}_{run_time.timestamp()}"
+    job_id = f"reminder_{reminder_id}"
     scheduler.add_job(
         send_reminder_job,
         trigger=DateTrigger(run_date=run_time),
         id=job_id,
         replace_existing=True,
+        args=[app],
         data={
             "reminder_id": reminder_id,
             "chat_id": chat_id,
             "text": text,
             "repeat_type": repeat_type,
         },
-        job_kwargs={"misfire_grace_time": 3600},
+        misfire_grace_time=3600,
     )
 
 
@@ -188,90 +245,116 @@ async def load_reminders_to_scheduler(app: Application):
     for row in rows:
         reminder_id, chat_id, text, next_run_iso, repeat_type = row
         next_run = datetime.fromisoformat(next_run_iso)
-        # Если время уже прошло, либо отправляем сразу, либо пересчитываем для повторяющихся
+
+        # Если время уже прошло — удаляем разовые, пересчитываем повторяющиеся
         if next_run < now:
             if repeat_type == "none":
                 delete_reminder_by_id(reminder_id)
                 continue
-            tz = pytz.timezone(DEFAULT_TIMEZONE)
-            next_run = compute_next_run(repeat_type, datetime.now(tz))
+            next_run = compute_next_run(repeat_type, datetime.now(TZ))
+            if not next_run:
+                continue
             update_next_run(reminder_id, next_run)
+
         schedule_reminder(app, reminder_id, chat_id, text, next_run, repeat_type)
+
+    logger.info(f"Загружено напоминаний из БД: {len(rows)}")
 
 
 # ---------------------- ОБРАБОТЧИКИ ----------------------
 
 START_TEXT = (
     "Привет! Я бот для напоминаний.\n\n"
-    "Команды:\n"
-    "/add — добавить напоминание\n"
-    "/list — список напоминаний\n"
-    "/delete — удалить напоминание\n"
-    "/help — помощь"
+    "Всё управление — кнопками ниже 👇"
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(START_TEXT)
+    await update.message.reply_text(START_TEXT, reply_markup=MAIN_MENU)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Формат добавления:\n"
-        "1. Введите текст напоминания\n"
-        "2. Введите дату и время в формате: ДД.ММ.ГГГГ ЧЧ:ММ\n"
-        "   Пример: 15.07.2026 14:30\n"
-        "3. Выберите периодичность: разово, ежедневно, еженедельно, ежемесячно\n\n"
-        f"Часовой пояс по умолчанию: {DEFAULT_TIMEZONE}"
+        "Как пользоваться:\n"
+        "• Нажми <b>➕ Добавить напоминание</b>\n"
+        "• Введи текст\n"
+        "• Выбери готовое время или введи своё в формате <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+        "• Выбери периодичность: разово, ежедневно, еженедельно или ежемесячно\n\n"
+        f"Часовой пояс: <b>{DEFAULT_TIMEZONE}</b>",
+        parse_mode="HTML",
     )
 
 
+# ---------- Добавление напоминания ----------
+
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите текст напоминания:")
+    await update.message.reply_text(
+        "Введите текст напоминания:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return TEXT
 
 
 async def add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["reminder_text"] = update.message.text
     await update.message.reply_text(
-        "Введите дату и время напоминания в формате:\n"
-        "<b>ДД.ММ.ГГГГ ЧЧ:ММ</b>\n\n"
-        "Пример: <code>15.07.2026 14:30</code>",
-        parse_mode="HTML",
+        "Выберите время напоминания:",
+        reply_markup=time_keyboard(),
     )
-    return DATETIME
+    return CHOOSE_TIME
 
 
-async def add_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "time_custom":
+        await query.edit_message_text(
+            "Введите дату и время в формате:\n"
+            "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+            "Пример: <code>15.07.2026 14:30</code>",
+            parse_mode="HTML",
+        )
+        return CUSTOM_TIME
+
+    minutes = int(data.split("_")[1])
+    run_time = datetime.now(TZ) + timedelta(minutes=minutes)
+    context.user_data["reminder_time"] = run_time
+
+    await query.edit_message_text(
+        f"⏰ Время: <b>{run_time.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"Выберите периодичность:",
+        parse_mode="HTML",
+        reply_markup=repeat_keyboard(),
+    )
+    return REPEAT
+
+
+async def custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
         naive = datetime.strptime(text, "%d.%m.%Y %H:%M")
     except ValueError:
         await update.message.reply_text(
-            "Неверный формат. Введите дату и время так:\n<code>15.07.2026 14:30</code>",
+            "Неверный формат. Введите так:\n<code>15.07.2026 14:30</code>",
             parse_mode="HTML",
         )
-        return DATETIME
+        return CUSTOM_TIME
 
-    tz = pytz.timezone(DEFAULT_TIMEZONE)
-    localized = tz.localize(naive)
-    if localized < datetime.now(tz):
+    localized = TZ.localize(naive)
+    if localized < datetime.now(TZ):
         await update.message.reply_text(
-            "Указанное время уже прошло. Введите будущую дату и время:"
+            "Это время уже прошло. Введите будущую дату и время:"
         )
-        return DATETIME
+        return CUSTOM_TIME
 
     context.user_data["reminder_time"] = localized
-
-    keyboard = [
-        [InlineKeyboardButton("Разово", callback_data="none")],
-        [InlineKeyboardButton("Ежедневно", callback_data="daily")],
-        [InlineKeyboardButton("Еженедельно", callback_data="weekly")],
-        [InlineKeyboardButton("Ежемесячно", callback_data="monthly")],
-    ]
     await update.message.reply_text(
-        "Выберите периодичность:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"⏰ Время: <b>{localized.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"Выберите периодичность:",
+        parse_mode="HTML",
+        reply_markup=repeat_keyboard(),
     )
     return REPEAT
 
@@ -290,57 +373,53 @@ async def add_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminder_id = add_reminder(user_id, chat_id, text, run_time, repeat_type)
     schedule_reminder(context.application, reminder_id, chat_id, text, run_time, repeat_type)
 
-    repeat_labels = {
-        "none": "разово",
-        "daily": "ежедневно",
-        "weekly": "еженедельно",
-        "monthly": "ежемесячно",
-    }
-
     await query.edit_message_text(
         f"✅ Напоминание установлено!\n\n"
         f"📝 Текст: {text}\n"
         f"📅 Время: {run_time.strftime('%d.%m.%Y %H:%M')}\n"
-        f"🔄 Периодичность: {repeat_labels[repeat_type]}"
+        f"🔄 Периодичность: {REPEAT_LABELS[repeat_type]}\n\n"
+        f"Оно сохранится и переживёт перезапуск бота.",
     )
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Добавление напоминания отменено.")
+    await update.message.reply_text(
+        "Отменено. Возвращаюсь в меню.",
+        reply_markup=MAIN_MENU,
+    )
     return ConversationHandler.END
 
+
+# ---------- Список и удаление ----------
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = get_user_reminders(user_id)
     if not rows:
-        await update.message.reply_text("У вас нет активных напоминаний.")
+        await update.message.reply_text("У вас нет активных напоминаний.", reply_markup=MAIN_MENU)
         return
 
-    lines = ["Ваши напоминания:\n"]
-    repeat_labels = {
-        "none": "разово",
-        "daily": "ежедневно",
-        "weekly": "еженедельно",
-        "monthly": "ежемесячно",
-    }
+    lines = ["📋 Ваши напоминания:\n"]
     for rid, text, next_run_iso, repeat_type in rows:
-        next_run = datetime.fromisoformat(next_run_iso).astimezone(pytz.timezone(DEFAULT_TIMEZONE))
+        next_run = datetime.fromisoformat(next_run_iso).astimezone(TZ)
         lines.append(
             f"<b>#{rid}</b>\n"
             f"📝 {text}\n"
             f"📅 {next_run.strftime('%d.%m.%Y %H:%M')}\n"
-            f"🔄 {repeat_labels.get(repeat_type, repeat_type)}\n"
+            f"🔄 {REPEAT_LABELS.get(repeat_type, repeat_type)}\n"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = get_user_reminders(user_id)
     if not rows:
-        await update.message.reply_text("У вас нет активных напоминаний для удаления.")
+        await update.message.reply_text(
+            "У вас нет активных напоминаний для удаления.",
+            reply_markup=MAIN_MENU,
+        )
         return ConversationHandler.END
 
     keyboard = []
@@ -366,10 +445,12 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if delete_reminder(reminder_id, user_id):
-        # Удаляем запланированные job'ы для этого reminder_id
-        for job in scheduler.get_jobs():
-            if job.data and job.data.get("reminder_id") == reminder_id:
-                job.remove()
+        # Удаляем job из планировщика
+        job_id = f"reminder_{reminder_id}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
         await query.edit_message_text("✅ Напоминание удалено.")
     else:
         await query.edit_message_text("Не удалось удалить напоминание.")
@@ -377,7 +458,7 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Удаление отменено.")
+    await update.message.reply_text("Удаление отменено.", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
 
@@ -388,28 +469,45 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add", add_start)],
+    add_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_start),
+            MessageHandler(filters.Regex("^➕ Добавить напоминание$"), add_start),
+        ],
         states={
             TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_text)],
-            DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_datetime)],
+            CHOOSE_TIME: [
+                CallbackQueryHandler(choose_time, pattern="^time_(5|10|30|120|360|720|custom)$")
+            ],
+            CUSTOM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_time)],
             REPEAT: [CallbackQueryHandler(add_repeat, pattern="^(none|daily|weekly|monthly)$")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
     )
 
     delete_conv = ConversationHandler(
-        entry_points=[CommandHandler("delete", delete_start)],
+        entry_points=[
+            CommandHandler("delete", delete_start),
+            MessageHandler(filters.Regex("^🗑 Удалить напоминание$"), delete_start),
+        ],
         states={
             "CHOOSE_DELETE": [CallbackQueryHandler(delete_confirm, pattern="^del_\\d+$")],
         },
-        fallbacks=[CommandHandler("cancel", delete_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", delete_cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), delete_cancel),
+        ],
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", list_reminders))
-    application.add_handler(conv_handler)
+    application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), list_reminders))
+    application.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_command))
+    application.add_handler(add_conv)
     application.add_handler(delete_conv)
 
     scheduler.start()
