@@ -127,6 +127,7 @@ def init_db():
             text TEXT NOT NULL,
             next_run TEXT NOT NULL,
             repeat_type TEXT NOT NULL DEFAULT 'none',
+            paused INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )
         """
@@ -242,12 +243,12 @@ def get_all_users():
     return rows
 
 
-def add_reminder(user_id: int, chat_id: int, text: str, next_run: datetime, repeat_type: str) -> int:
+def add_reminder(user_id: int, chat_id: int, text: str, next_run: datetime, repeat_type: str, paused: int = 0) -> int:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO reminders (user_id, chat_id, text, next_run, repeat_type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, chat_id, text, next_run.isoformat(), repeat_type, datetime.now(pytz.utc).isoformat()),
+        "INSERT INTO reminders (user_id, chat_id, text, next_run, repeat_type, paused, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, chat_id, text, next_run.isoformat(), repeat_type, paused, datetime.now(pytz.utc).isoformat()),
     )
     reminder_id = c.lastrowid
     conn.commit()
@@ -259,7 +260,7 @@ def get_user_reminders(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT id, text, next_run, repeat_type FROM reminders WHERE user_id = ? ORDER BY next_run",
+        "SELECT id, text, next_run, repeat_type, paused FROM reminders WHERE user_id = ? ORDER BY next_run",
         (user_id,),
     )
     rows = c.fetchall()
@@ -270,7 +271,7 @@ def get_user_reminders(user_id: int):
 def get_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, user_id, chat_id, text, next_run, repeat_type FROM reminders WHERE id = ?", (reminder_id,))
+    c.execute("SELECT id, user_id, chat_id, text, next_run, repeat_type, paused FROM reminders WHERE id = ?", (reminder_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -300,6 +301,16 @@ def delete_reminder_by_id(reminder_id: int):
     c.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
     conn.commit()
     conn.close()
+
+
+def set_reminder_paused(reminder_id: int, user_id: int, paused: bool) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET paused = ? WHERE id = ? AND user_id = ?", (int(paused), reminder_id, user_id))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
 
 
 def add_habit(user_id: int, name: str, habit_type: str) -> int:
@@ -684,13 +695,14 @@ def schedule_reminder(app: Application, reminder_id: int, chat_id: int, text: st
 async def load_reminders_to_scheduler(app: Application):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, chat_id, text, next_run, repeat_type FROM reminders")
+    c.execute("SELECT id, chat_id, text, next_run, repeat_type, paused FROM reminders")
     rows = c.fetchall()
     conn.close()
 
     now = datetime.now(pytz.utc)
+    active_count = 0
     for row in rows:
-        reminder_id, chat_id, text, next_run_iso, repeat_type = row
+        reminder_id, chat_id, text, next_run_iso, repeat_type, paused = row
         next_run = datetime.fromisoformat(next_run_iso)
 
         if next_run < now:
@@ -702,9 +714,11 @@ async def load_reminders_to_scheduler(app: Application):
                 continue
             update_next_run(reminder_id, next_run)
 
-        schedule_reminder(app, reminder_id, chat_id, text, next_run, repeat_type)
+        if not paused:
+            schedule_reminder(app, reminder_id, chat_id, text, next_run, repeat_type)
+            active_count += 1
 
-    logger.info(f"Загружено напоминаний из БД: {len(rows)}")
+    logger.info(f"Загружено напоминаний из БД: {len(rows)}, активных: {active_count}")
 
 
 async def send_habit_reminder_job(context, application: Application):
@@ -1104,13 +1118,21 @@ async def add_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminder_id = add_reminder(user_id, chat_id, text, run_time, repeat_type)
     schedule_reminder(context.application, reminder_id, chat_id, text, run_time, repeat_type)
 
-    await query.edit_message_text(
-        f"✅ Напоминание установлено!\n\n"
-        f"📝 Текст: {text}\n"
-        f"📅 Время: {run_time.strftime('%d.%m.%Y %H:%M')}\n"
-        f"🔄 Периодичность: {REPEAT_LABELS[repeat_type]}"
-    )
-    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+    try:
+        await query.edit_message_text(
+            f"✅ Напоминание установлено!\n\n"
+            f"📝 Текст: {text}\n"
+            f"📅 Время: {run_time.strftime('%d.%m.%Y %H:%M')}\n"
+            f"🔄 Периодичность: {REPEAT_LABELS[repeat_type]}"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение: {e}")
+
+    try:
+        await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+    except Exception as e:
+        logger.error(f"Не удалось отправить меню: {e}")
+        await context.application.bot.send_message(chat_id=chat_id, text="Главное меню:", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
 
@@ -1124,58 +1146,172 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = get_user_reminders(user_id)
     if not rows:
-        await update.message.reply_text("У вас нет активных напоминаний.", reply_markup=MAIN_MENU)
+        text = "У вас нет активных напоминаний."
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(text)
+            await update.callback_query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+        else:
+            await update.message.reply_text(text, reply_markup=MAIN_MENU)
         return
 
-    lines = ["📋 Ваши напоминания:\n"]
-    for rid, text, next_run_iso, repeat_type in rows:
-        next_run = datetime.fromisoformat(next_run_iso).astimezone(TZ)
-        lines.append(
-            f"<b>#{rid}</b>\n"
-            f"📝 {text}\n"
-            f"📅 {next_run.strftime('%d.%m.%Y %H:%M')}\n"
-            f"🔄 {REPEAT_LABELS.get(repeat_type, repeat_type)}\n"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
-
-
-async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_from_update(update)
-    user_id = update.effective_user.id
-    rows = get_user_reminders(user_id)
-    if not rows:
-        await update.message.reply_text(
-            "У вас нет активных напоминаний для удаления.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
+    lines = ["<b>📋 Ваши напоминания</b>\n"]
     keyboard = []
-    for rid, text, _, _ in rows:
-        label = f"#{rid}: {text[:30]}{'...' if len(text) > 30 else ''}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"delr_{rid}")])
+    for rid, text, next_run_iso, repeat_type, paused in rows:
+        next_run = datetime.fromisoformat(next_run_iso).astimezone(TZ)
+        status = " ⏸ на паузе" if paused else ""
+        lines.append(
+            f"<b>#{rid}</b>{status}\n"
+            f"📝 {text}\n"
+            f"📅 {next_run.strftime('%d.%m.%Y %H:%M')} · 🔄 {REPEAT_LABELS.get(repeat_type, repeat_type)}"
+        )
+        label = f"⚙️ #{rid}: {text[:25]}{'...' if len(text) > 25 else ''}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"reminder_{rid}")])
+
     keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="menu")])
 
-    await update.message.reply_text(
-        "Выберите напоминание для удаления:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return "CHOOSE_DELETE_REMINDER"
+    text = "\n\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reminder_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data == "menu":
         await back_to_menu(update, "Главное меню")
-        return ConversationHandler.END
+        return
 
-    if not data.startswith("delr_"):
-        return ConversationHandler.END
+    if data == "reminders_list":
+        await list_reminders(update, context)
+        return
+
+    if not data.startswith("reminder_"):
+        return
 
     reminder_id = int(data.split("_")[1])
+    user_id = update.effective_user.id
+    row = get_reminder(reminder_id)
+
+    if not row or row[1] != user_id:
+        await query.edit_message_text("Напоминание не найдено.")
+        return
+
+    _, _, chat_id, text, next_run_iso, repeat_type, paused = row
+    next_run = datetime.fromisoformat(next_run_iso).astimezone(TZ)
+    status = "⏸ на паузе" if paused else "▶️ активно"
+
+    action_text = (
+        f"<b>📝 Напоминание #{reminder_id}</b>\n\n"
+        f"{text}\n\n"
+        f"📅 {next_run.strftime('%d.%m.%Y %H:%M')}\n"
+        f"🔄 {REPEAT_LABELS.get(repeat_type, repeat_type)}\n"
+        f"Статус: <b>{status}</b>"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔁 Повторить", callback_data=f"remind_now_{reminder_id}"),
+            InlineKeyboardButton("▶️ Возобновить" if paused else "⏸ Пауза", callback_data=f"remind_toggle_{reminder_id}"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"remind_delete_{reminder_id}"),
+            InlineKeyboardButton("🔙 Назад", callback_data="reminders_list"),
+        ],
+    ]
+    await query.edit_message_text(action_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def remind_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if not data.startswith("remind_now_"):
+        return
+
+    reminder_id = int(data.split("_")[2])
+    user_id = update.effective_user.id
+    row = get_reminder(reminder_id)
+
+    if not row or row[1] != user_id:
+        await query.edit_message_text("Напоминание не найдено.")
+        return
+
+    _, _, chat_id, text, next_run_iso, repeat_type, paused = row
+
+    try:
+        await context.application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание:\n{text}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки напоминания {reminder_id}: {e}")
+        await query.edit_message_text("Не удалось отправить напоминание.")
+        return
+
+    if repeat_type != "none":
+        next_run = datetime.fromisoformat(next_run_iso)
+        new_run = compute_next_run(repeat_type, next_run)
+        if new_run:
+            update_next_run(reminder_id, new_run)
+            if not paused:
+                schedule_reminder(context.application, reminder_id, chat_id, text, new_run, repeat_type)
+
+    await query.edit_message_text("✅ Напоминание отправлено.")
+    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+
+
+async def remind_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if not data.startswith("remind_toggle_"):
+        return
+
+    reminder_id = int(data.split("_")[2])
+    user_id = update.effective_user.id
+    row = get_reminder(reminder_id)
+
+    if not row or row[1] != user_id:
+        await query.edit_message_text("Напоминание не найдено.")
+        return
+
+    _, _, chat_id, text, next_run_iso, repeat_type, paused = row
+    new_paused = not paused
+
+    set_reminder_paused(reminder_id, user_id, new_paused)
+
+    job_id = f"reminder_{reminder_id}"
+    if new_paused:
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        await query.edit_message_text("⏸ Напоминание поставлено на паузу.")
+    else:
+        next_run = datetime.fromisoformat(next_run_iso)
+        if next_run > datetime.now(pytz.utc):
+            schedule_reminder(context.application, reminder_id, chat_id, text, next_run, repeat_type)
+            await query.edit_message_text("▶️ Напоминание возобновлено.")
+        else:
+            await query.edit_message_text("▶️ Напоминание возобновлено, но время уже прошло — отредактируйте время.")
+
+    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+
+
+async def remind_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if not data.startswith("remind_delete_"):
+        return
+
+    reminder_id = int(data.split("_")[2])
     user_id = update.effective_user.id
 
     if delete_reminder(reminder_id, user_id):
@@ -1189,6 +1325,10 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Не удалось удалить напоминание.")
 
     await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+
+
+async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await list_reminders(update, context)
     return ConversationHandler.END
 
 
@@ -1818,19 +1958,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    delete_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("delete", delete_start),
-            MessageHandler(filters.Regex("^🗑 Удалить напоминание$"), delete_start),
-        ],
-        states={
-            "CHOOSE_DELETE_REMINDER": [
-                CallbackQueryHandler(delete_confirm, pattern="^(delr_\\d+|menu)$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
     habit_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(add_habit_start, pattern="^habits_add$"),
@@ -1881,7 +2008,6 @@ def main():
     )
 
     application.add_handler(add_conv)
-    application.add_handler(delete_conv)
     application.add_handler(habit_conv)
     application.add_handler(delete_habit_conv)
     application.add_handler(habit_reminder_conv)
@@ -1891,12 +2017,14 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", list_reminders))
+    application.add_handler(CommandHandler("delete", list_reminders))
     application.add_handler(CommandHandler("today", today_dashboard))
     application.add_handler(MessageHandler(filters.Regex("^📅 Сегодня$"), today_dashboard))
     application.add_handler(MessageHandler(filters.Regex("^🎯 Привычки$"), habits_menu))
     application.add_handler(MessageHandler(filters.Regex("^💧 Вода$"), water_menu))
     application.add_handler(MessageHandler(filters.Regex("^😴 Сон$"), sleep_menu))
     application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), list_reminders))
+    application.add_handler(MessageHandler(filters.Regex("^🗑 Удалить напоминание$"), list_reminders))
     application.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_command))
 
     application.add_handler(CallbackQueryHandler(habits_menu, pattern="^habits_menu$"))
@@ -1912,6 +2040,10 @@ def main():
     application.add_handler(CallbackQueryHandler(sleep_stats, pattern="^sleep_stats$"))
     application.add_handler(CallbackQueryHandler(sleep_toggle, pattern="^sleep_toggle$"))
     application.add_handler(CallbackQueryHandler(sleep_reminder_toggle, pattern="^sleep_rem_toggle$"))
+    application.add_handler(CallbackQueryHandler(reminder_actions, pattern="^(reminder_\\d+|reminders_list)$"))
+    application.add_handler(CallbackQueryHandler(remind_now, pattern="^remind_now_\\d+$"))
+    application.add_handler(CallbackQueryHandler(remind_toggle, pattern="^remind_toggle_\\d+$"))
+    application.add_handler(CallbackQueryHandler(remind_delete, pattern="^remind_delete_\\d+$"))
     application.add_handler(CallbackQueryHandler(start, pattern="^menu$"))
 
     scheduler.start()
